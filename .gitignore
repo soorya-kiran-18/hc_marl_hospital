@@ -1,0 +1,5 @@
+venv/
+__pycache__/
+*.pyc
+.DS_Store
+data/nhamcs_18_22.csv
