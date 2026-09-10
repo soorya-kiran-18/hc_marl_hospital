@@ -5,6 +5,23 @@ safe hospital resource allocation, built on the NHAMCS 2018–2022 ED-visit
 dataset. This README documents what the codebase actually does, what was
 fixed after an earlier AI-assisted pass, and how to reproduce every result.
 
+## Quick start
+
+Run from the repo root, in order, in the same shell (so the venv stays active):
+
+```bash
+python3 -m venv venv
+source venv/bin/activate
+pip install numpy pandas scipy scikit-learn matplotlib joblib
+
+# place the raw dataset at data/nhamcs_data_2018_22.csv first, then:
+python3 -m src.data_processing   # cleans data, writes data/processed/{train,val,test}.csv
+python3 -m src.triage_models     # baseline ESI classifiers + fairness check -> docs/
+python3 -m src.hospital_env      # smoke-test the simulator alone
+python3 -m src.train             # runs all 5 comparison methods, 3 seeds -> docs/ (~2-3 min)
+python3 -m src.make_plots        # builds docs/training_convergence.png, docs/comparative_analysis.png
+```
+
 ## Repository layout
 
 ```
