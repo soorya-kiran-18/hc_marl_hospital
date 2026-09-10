@@ -1,50 +1,46 @@
 import numpy as np
 
+EQUITY_GROUPS = ['Private', 'Medicaid', 'Medicare', 'SelfPay', 'Other/Unknown']
+
+
 class ConstraintFilter:
+    """
+    Hard CMDP safety constraint: a proposed nurse allocation is rejected if
+    it would push any department's current patient-to-nurse ratio beyond the
+    clinical limit. `nurses` and `census` are the *total* (base + floating)
+    nurse counts and current patient counts per department, as returned by
+    HospitalEnv.nurses_for(...) and HospitalEnv.current_census().
+    """
+
     def __init__(self):
-        # Maximum allowed patient-to-nurse ratios based on standard clinical guidelines
         self.max_ratios = {'ER': 4.0, 'ICU': 2.0, 'Ward': 6.0}
 
-    def verify_action_safety(self, action_budget, current_patients):
-        """
-        Hard Constraint: Evaluates if a proposed nurse allocation violates safety ratios.
-        action_budget: dict of proposed nurse counts per department
-        current_patients: dict of current patient census per department
-        """
+    def verify_action_safety(self, nurses, census):
         for dept in ['ER', 'ICU', 'Ward']:
-            nurses = action_budget.get(dept, 1)
-            patients = current_patients.get(dept, 0)
-            
-            if nurses <= 0:
+            n = nurses.get(dept, 1)
+            p = census.get(dept, 0)
+            if n <= 0:
                 return False
-                
-            ratio = patients / nurses
-            if ratio > self.max_ratios[dept]:
-                return False  # Safety violation triggered
-                
-        return True  # Action is safe
+            if p / n > self.max_ratios[dept]:
+                return False
+        return True
+
 
 def calculate_equity_penalty(wait_times_by_group, lambda_weight):
     """
-    Soft Penalty: Calculates the variance in wait times across demographic groups.
-    R_global equation: penalizes deviations from the global average wait time.
+    Soft penalty term from the global reward:
+        lambda * sum_d |E[T_d] - E[T_all]|
+    wait_times_by_group: dict of equity_group -> list of observed wait times
+    (in simulation steps or minutes; caller must be consistent).
     """
-    if not wait_times_by_group:
+    all_waits = [w for times in wait_times_by_group.values() for w in times]
+    if not all_waits:
         return 0.0
-        
-    all_wait_times = []
-    for times in wait_times_by_group.values():
-        all_wait_times.extend(times)
-        
-    if len(all_wait_times) == 0:
-        return 0.0
-        
-    t_all_mean = np.mean(all_wait_times)
+
+    t_all_mean = np.mean(all_waits)
     penalty = 0.0
-    
-    for group, times in wait_times_by_group.items():
+    for times in wait_times_by_group.values():
         if len(times) > 0:
-            t_d_mean = np.mean(times)
-            penalty += abs(t_d_mean - t_all_mean)
-            
+            penalty += abs(np.mean(times) - t_all_mean)
+
     return lambda_weight * penalty

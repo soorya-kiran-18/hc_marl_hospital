@@ -5,6 +5,17 @@ from sklearn.model_selection import train_test_split
 import warnings
 warnings.filterwarnings("ignore")
 
+# Raw NHAMCS insurance strings observed in data/nhamcs_data_2018_22.csv.
+# Anything not listed here (Unknown/Blank, Other, Workers_Comp, Charity, ...)
+# falls into 'Other/Unknown'.
+INSURANCE_MAP = {
+    'Private': 'Private',
+    'Medicare': 'Medicare',
+    'Medicaid/Public': 'Medicaid',
+    'Self_Pay': 'SelfPay',
+}
+
+
 def clean_and_process(filepath="data/nhamcs_data_2018_22.csv"):
     print(f"Loading dataset from {filepath}...")
     if not os.path.exists(filepath):
@@ -14,39 +25,42 @@ def clean_and_process(filepath="data/nhamcs_data_2018_22.csv"):
     df = pd.read_csv(filepath)
     print(f"Initial raw rows: {len(df)}")
 
-    # 1. Clean Impossible Physiological Vitals
+    # 1. Clean impossible physiological vitals to NaN. Median-imputation is
+    # left to the modeling stage (fit on the train split only) so no test/val
+    # statistics leak into training.
     print("Cleaning clinical vitals...")
-    vital_cols = ['heart_rate', 'sys_bp', 'dias_bp', 'resp_rate', 'temp', 'spo2']
-    for col in vital_cols:
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors='coerce')
-            # Filter biologically impossible limits
-            if col == 'heart_rate':
-                df.loc[(df[col] < 20) | (df[col] > 300), col] = np.nan
-            elif col == 'sys_bp':
-                df.loc[(df[col] < 40) | (df[col] > 260), col] = np.nan
-            elif col == 'temp':
-                df.loc[(df[col] < 85) | (df[col] > 110), col] = np.nan
-            df[col] = df[col].fillna(df[col].median())
+    if 'heart_rate' in df.columns:
+        df['heart_rate'] = pd.to_numeric(df['heart_rate'], errors='coerce')
+        df.loc[(df['heart_rate'] < 20) | (df['heart_rate'] > 300), 'heart_rate'] = np.nan
+    if 'sys_bp' in df.columns:
+        df['sys_bp'] = pd.to_numeric(df['sys_bp'], errors='coerce')
+        df.loc[(df['sys_bp'] < 40) | (df['sys_bp'] > 260), 'sys_bp'] = np.nan
+    if 'dias_bp' in df.columns:
+        df['dias_bp'] = pd.to_numeric(df['dias_bp'], errors='coerce')
+        df.loc[(df['dias_bp'] < 20) | (df['dias_bp'] > 200), 'dias_bp'] = np.nan
+    if 'resp_rate' in df.columns:
+        df['resp_rate'] = pd.to_numeric(df['resp_rate'], errors='coerce')
+        df.loc[(df['resp_rate'] < 4) | (df['resp_rate'] > 80), 'resp_rate'] = np.nan
+    if 'temp' in df.columns:
+        df['temp'] = pd.to_numeric(df['temp'], errors='coerce')
+        df.loc[(df['temp'] < 85) | (df['temp'] > 110), 'temp'] = np.nan
+    if 'spo2' in df.columns:
+        df['spo2'] = pd.to_numeric(df['spo2'], errors='coerce')
+        df.loc[(df['spo2'] < 50) | (df['spo2'] > 100), 'spo2'] = np.nan
 
-    # 2. Map Equity Groups (Insurance)
+    # 2. Map raw insurance strings into the 5 equity groups used for the
+    # fairness evaluation and the RL equity penalty.
     print("Mapping insurance equity groups...")
     if 'insurance' in df.columns:
-        insurance_map = {
-            'Private': 'Private',
-            'Medicaid': 'Medicaid',
-            'Medicare': 'Medicare',
-            'Self-Pay': 'SelfPay',
-            'SelfPay': 'SelfPay'
-        }
-        df['equity_group'] = df['insurance'].map(insurance_map).fillna('Other/Unknown')
+        df['equity_group'] = df['insurance'].map(INSURANCE_MAP).fillna('Other/Unknown')
     else:
         df['equity_group'] = 'Other/Unknown'
 
-    # 3. Feature Engineering
+    # 3. Feature engineering (all values known at/before the triage decision,
+    # so none of this introduces post-triage leakage).
     if 'arrival_time' in df.columns:
-        df['arrival_hour'] = (pd.to_numeric(df['arrival_time'], errors='coerce') // 100).fillna(12)
-    
+        df['arrival_hour'] = (pd.to_numeric(df['arrival_time'], errors='coerce') // 100).clip(0, 23).fillna(12)
+
     if 'heart_rate' in df.columns and 'sys_bp' in df.columns:
         df['shock_index'] = df['heart_rate'] / (df['sys_bp'] + 1e-5)
 
@@ -56,13 +70,19 @@ def clean_and_process(filepath="data/nhamcs_data_2018_22.csv"):
     else:
         df['chronic_conditions'] = 0
 
-    # 4. Target Variable Resolution (target_triage_acuity)
+    if 'ems_arrival' in df.columns:
+        df['ems_arrival_flag'] = (df['ems_arrival'] == 'Yes').astype(int)
+
+    if 'is_injury_poison' in df.columns:
+        df['injury_flag'] = (~df['is_injury_poison'].isin(['No injury'])).astype(int)
+
+    # 4. Target variable resolution (ESI 1-5, 1 = most critical)
     target_col = 'target_triage_acuity' if 'target_triage_acuity' in df.columns else 'triage_level'
-    df = df.dropna(subset=[target_col])
     df[target_col] = pd.to_numeric(df[target_col], errors='coerce')
+    df = df.dropna(subset=[target_col])
     df = df[df[target_col].isin([1, 2, 3, 4, 5])]
 
-    # 5. Stratified 70/15/15 Split
+    # 5. Stratified 70/15/15 split by triage level
     print("Executing 70/15/15 stratified split...")
     train_df, temp_df = train_test_split(df, test_size=0.30, stratify=df[target_col], random_state=42)
     val_df, test_df = train_test_split(temp_df, test_size=0.50, stratify=temp_df[target_col], random_state=42)
@@ -72,8 +92,11 @@ def clean_and_process(filepath="data/nhamcs_data_2018_22.csv"):
     val_df.to_csv("data/processed/val.csv", index=False)
     test_df.to_csv("data/processed/test.csv", index=False)
 
-    print(f"Data processing complete.")
+    print("Data processing complete.")
     print(f"Train: {len(train_df)} | Val: {len(val_df)} | Test: {len(test_df)}")
+    print("\nEquity group counts (full dataset):")
+    print(df['equity_group'].value_counts())
+
 
 if __name__ == "__main__":
     clean_and_process()
