@@ -122,7 +122,29 @@ class HospitalEnv:
     def current_census(self):
         return {d: len(self.departments[d]) for d in self.departments}
 
-    def step(self, meta_action):
+    def local_state(self, dept):
+        """
+        3-dim local observation for department `dept`'s Local Agent:
+        [own utilization, ER boarding-queue pressure, time of day]. This is
+        a department-specific slice of the same global observation the
+        Meta-Agent sees -- Local Agents get no privileged extra information,
+        only their own view of it, consistent with decentralized execution.
+        """
+        obs = self._get_obs()
+        util_idx = {'ER': 0, 'ICU': 1, 'Ward': 2}[dept]
+        return np.array([obs[util_idx], obs[3], obs[4]], dtype=np.float32)
+
+    def step(self, meta_action, local_actions=None):
+        """
+        meta_action: Meta-Agent's macro floating-nurse allocation [ER, ICU, Ward].
+        local_actions: optional dict {'ER': [admission_rate, equity_priority],
+        'ICU': [...], 'Ward': [...]} from the decentralized Local Agents
+        (see agents.LocalAgent). When None -- the uncoordinated single-agent
+        baselines (FCFS-Static, ESI-Proportional) -- admission reverts to the
+        original flat rule with no learned prioritization or per-department
+        throttling, matching the paper's "uncoordinated single-agent
+        baseline" semantics for those methods.
+        """
         nurses = self.nurses_for(meta_action)
         capacity = {
             'ER': nurses['ER'] * self.er_ratio_limit,
@@ -142,22 +164,12 @@ class HospitalEnv:
                 self.departments['ER'].append({'equity_group': str(equity), 'esi': int(esi),
                                                 'wait': 0, 'target': target_dept, 'admitted': False})
 
-        # 2. move boarding ER patients into their target dept if capacity allows;
-        #    ESI 4-5 patients are "treated" directly in the ER once seen.
-        new_er_list = []
-        for p in self.departments['ER']:
-            if p['target'] != 'ER' and len(self.departments[p['target']]) < capacity[p['target']]:
-                p['admitted'] = True
-                self.wait_times[p['equity_group']].append(p['wait'])
-                self.departments[p['target']].append(p)
-            elif p['target'] == 'ER' and not p['admitted'] and self.rng.random() < 0.5:
-                p['admitted'] = True
-                self.wait_times[p['equity_group']].append(p['wait'])
-                new_er_list.append(p)
-            else:
-                p['wait'] += 1
-                new_er_list.append(p)
-        self.departments['ER'] = new_er_list
+        # 2. department admission/triage -- decentralized Local Agents if
+        #    provided, else the original flat single-agent rule
+        if local_actions is None:
+            self.departments['ER'] = self._flat_admission_step(capacity)
+        else:
+            self.departments['ER'] = self._local_agent_admission_step(capacity, local_actions)
 
         # 3. stochastic discharge from each department
         safety_violation = 0
@@ -188,16 +200,118 @@ class HospitalEnv:
             'nurses': nurses,
             'census': {d: len(self.departments[d]) for d in self.departments},
         }
-        reward = self._step_reward(utilization, mean_wait)
+        reward = self._step_reward(utilization, mean_wait, safety_violation)
         return self._get_obs(), reward, done, info
 
+    def _flat_admission_step(self, capacity):
+        """
+        Original uncoordinated single-agent admission rule (no Local
+        Agents): move boarding ER patients into their target dept if
+        capacity allows (first-in-list order, no learned prioritization);
+        ESI 4-5 patients are "treated" directly in the ER with a fixed
+        per-step probability. Used by the flat baselines (FCFS-Static,
+        ESI-Proportional) so their dynamics stay exactly as before.
+        """
+        new_er_list = []
+        for p in self.departments['ER']:
+            if p['target'] != 'ER' and len(self.departments[p['target']]) < capacity[p['target']]:
+                p['admitted'] = True
+                self.wait_times[p['equity_group']].append(p['wait'])
+                self.departments[p['target']].append(p)
+            elif p['target'] == 'ER' and not p['admitted'] and self.rng.random() < 0.5:
+                p['admitted'] = True
+                self.wait_times[p['equity_group']].append(p['wait'])
+                new_er_list.append(p)
+            else:
+                p['wait'] += 1
+                new_er_list.append(p)
+        return new_er_list
+
+    def _local_agent_admission_step(self, capacity, local_actions):
+        """
+        Decentralized Local Agent admission/triage (HC-MARL methods only).
+        Each department always admits as many candidates as its *verified*
+        capacity allows this step (structurally impossible to overcrowd via
+        admission alone -- there is never a reward-side reason to admit
+        slower than "as many as safely fit," so that volume is fixed rather
+        than left to a noisy per-episode learning estimate). Candidates are
+        ranked by clinical severity (ESI) first; the department's learned
+        equity_priority breaks ties among patients of equal acuity.
+        """
+        admitted_ids = set()
+
+        for target_dept in ['ICU', 'Ward']:
+            candidates = [p for p in self.departments['ER']
+                          if p['target'] == target_dept and not p['admitted']]
+            if not candidates:
+                continue
+            equity_priority = local_actions[target_dept]
+            if equity_priority > 0.5:
+                candidates.sort(key=lambda p: (p['esi'], -p['wait']))  # longest-waiting first, within acuity
+            else:
+                candidates.sort(key=lambda p: (p['esi'], p['wait']))
+            available_slots = max(capacity[target_dept] - len(self.departments[target_dept]), 0)
+            n_admit = min(available_slots, len(candidates))
+            for p in candidates[:n_admit]:
+                p['admitted'] = True
+                self.wait_times[p['equity_group']].append(p['wait'])
+                self.departments[target_dept].append(p)
+                admitted_ids.add(id(p))
+
+        er_candidates = [p for p in self.departments['ER']
+                          if p['target'] == 'ER' and not p['admitted']]
+        if er_candidates:
+            equity_priority = local_actions['ER']
+            if equity_priority > 0.5:
+                er_candidates.sort(key=lambda p: -p['wait'])  # longest-waiting first
+            else:
+                er_candidates.sort(key=lambda p: p['wait'])
+            # ER "admission" here means starting treatment (occupied ER bed
+            # count doesn't change either way), so it isn't gated by bed
+            # capacity like ICU/Ward -- it's gated by *staff* throughput
+            # instead: one new ESI 4-5 patient seen per ER nurse per step.
+            # This is a structural, nurse-count-derived cap (not learned),
+            # so the Meta-Agent's nurse allocation still matters for ER
+            # throughput, while the Local Agent's equity_priority decides
+            # who among the waiting queue gets seen first when demand
+            # exceeds that throughput.
+            er_treat_capacity = int(capacity['ER'] / self.er_ratio_limit)  # = ER nurse count
+            n_treat = min(er_treat_capacity, len(er_candidates))
+            for p in er_candidates[:n_treat]:
+                p['admitted'] = True
+                self.wait_times[p['equity_group']].append(p['wait'])
+                admitted_ids.add(id(p))
+
+        new_er_list = []
+        for p in self.departments['ER']:
+            if p['target'] != 'ER' and id(p) in admitted_ids:
+                continue  # moved out to ICU/Ward above
+            if id(p) not in admitted_ids and not p['admitted']:
+                p['wait'] += 1
+            new_er_list.append(p)
+        return new_er_list
+
     @staticmethod
-    def _step_reward(utilization, mean_wait, alpha=1.0, beta=0.05):
+    def _step_reward(utilization, mean_wait, safety_violation, alpha=1.0, beta=0.05, violation_penalty=8.0):
         # R_step = alpha * sum(min(U_i, 1)) - overflow_penalty - beta * mean_wait
+        #          - violation_penalty * safety_violation
         # matches the utilization/wait terms of the paper's global reward
         # (eq. 1); the equity term is added separately, once per episode.
+        #
+        # The flat violation_penalty term is deliberately large relative to
+        # the per-department utilization reward (max +1.0/dept): the paper
+        # treats clinical safety as a hard constraint and equity/throughput
+        # as secondary, soft objectives, so a policy that trades a safety
+        # violation for extra utilization elsewhere must never come out
+        # ahead. Without this term we observed exactly that failure mode in
+        # training: the graded overflow penalty on utilization alone (the
+        # max(u-1,0)*2.0 term below) was not always enough to outweigh the
+        # reward gained by packing another department to 100%, so ES
+        # sometimes learned to sacrifice one department's safety for
+        # another's throughput. This term makes any such trade strictly
+        # reward-negative.
         utilization_term = sum(min(u, 1.0) - max(u - 1.0, 0.0) * 2.0 for u in utilization.values())
-        return alpha * utilization_term - beta * mean_wait
+        return alpha * utilization_term - beta * mean_wait - violation_penalty * safety_violation
 
     def equity_gap(self):
         """Max |group mean wait - overall mean wait| in 15-min steps."""

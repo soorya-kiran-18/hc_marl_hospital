@@ -34,7 +34,7 @@ hc_marl_hospital/
 │   ├── data_processing.py          # cleaning, feature engineering, equity mapping, split
 │   ├── triage_models.py            # baseline ESI classifiers + fairness check
 │   ├── hospital_env.py             # 15-min-step ER/ICU/Ward simulator
-│   ├── agents.py                   # MetaAgent (Evolution Strategies policy)
+│   ├── agents.py                   # MetaAgent + LocalAgent (ER/ICU/Ward), Evolution Strategies
 │   ├── controllers.py              # FCFS-Static / ESI-Proportional baselines
 │   ├── constraints.py              # CMDP safety filter + equity penalty
 │   ├── train.py                    # runs all 5 methods, 3 seeds, logs results
@@ -64,7 +64,9 @@ python3 -m src.make_plots        # builds docs/training_convergence.png, docs/co
 ```
 
 Full run time on a laptop CPU: data processing + triage models ≈ 15s,
-`src.train` ≈ 2 minutes (750 episodes × 5 methods × ES perturbations).
+`src.train` ≈ 9–10 minutes (750 episodes × 5 methods; the three HC-MARL
+methods now co-train a Meta-Agent + 3 Local Agents per episode instead of
+a single agent, which is the bulk of the added time over the old ≈2 min).
 
 ## What each stage does
 
@@ -125,21 +127,63 @@ simulated day (96 steps), built on real sampled NHAMCS patient records
 
 ### 4. Agents and safety/equity mechanisms
 
-- `agents.py` — `MetaAgent`: a linear-softmax policy over hospital state
-  (utilization pressure per department, boarding queue size, time of day)
-  that outputs a floating-nurse allocation. Learns via antithetic
-  **Evolution Strategies** (8 perturbation directions per update) — chosen
-  over full PPO/backprop because it needs no gradient through the
-  simulator and stays honestly within "plain NumPy RL."
-- `controllers.py` — two rule-based baselines: `FCFSController` (static
-  split proportional to base staffing, no adaptation) and
+This is the paper's actual four-component architecture, all implemented:
+
+- **`agents.py` — `MetaAgent`** (Global Meta-Agent, executive level): a
+  linear-softmax policy over hospital global state (utilization pressure
+  per department, boarding queue size, time of day) that outputs a
+  floating-nurse allocation across [ER, ICU, Ward] every ~4 hours (16
+  simulation steps). Learns via antithetic **Evolution Strategies**
+  (16 perturbation directions per update, returns z-score normalized
+  before the gradient estimate — see "ES stability" below).
+- **`agents.py` — `LocalAgent`** (Local Agents, one per department: ER,
+  ICU, Ward): decentralized department-head agents that act every 15-minute
+  step from their own department-local observation only (no direct
+  peer-to-peer communication — coupling is indirect, through the shared
+  simulation environment and the Meta-Agent's finite nurse budget, matching
+  the paper's "hierarchical decentralized execution"). Each Local Agent
+  learns one thing: an `equity_priority` tie-break rule for which patient
+  gets admitted first among candidates of equal clinical urgency (ESI).
+  *Admission volume* is deliberately not learned — the environment always
+  admits as many boarding patients as the Meta-Agent-derived, Safety-Filter
+  verified capacity allows, which is what makes ICU/Ward overcrowding via
+  admission structurally impossible rather than merely discouraged. (An
+  earlier version also tried to learn admission *rate*; a partially-trained
+  agent stuck near 50% choked patient outflow and made safety violations
+  *worse*, not better — see the ES stability note.)
+- **`controllers.py`** — two rule-based, "uncoordinated single-agent"
+  baselines the paper's evaluation section calls for: `FCFSController`
+  (static split proportional to base staffing, no adaptation) and
   `ESIProportionalController` (static split proportional to the historical
-  ESI acuity mix).
-- `constraints.py` — `ConstraintFilter` (hard CMDP check: rejects any
-  proposed allocation that would push a department's patient-to-nurse
+  ESI acuity mix). These do not get Local Agents — only the HC-MARL methods
+  use the full hierarchy.
+- **`constraints.py`** — `ConstraintFilter` (hard CMDP check: rejects any
+  Meta-Agent allocation that would push a department's patient-to-nurse
   ratio past its limit, falling back to base-only staffing) and
   `calculate_equity_penalty` (the soft `λ·Σ|E[T_d] − E[T_all]|` term from
   the paper's reward equation).
+- **`hospital_env.py`** — the shared Hospital Simulation Environment: the
+  only channel through which the Meta-Agent and the three Local Agents
+  ever interact.
+
+**ES stability.** Co-training four agents (one Meta-Agent + three Local
+Agents) off a single shared episode reward has noticeably higher reward
+variance than training the Meta-Agent alone. An un-normalized antithetic-ES
+update (the original single-agent implementation) is not robust to that:
+in testing it occasionally blew Meta-Agent weights up to extreme magnitudes
+within a few dozen episodes, collapsing the softmax into a degenerate
+"always give one department 100% of the float nurses, ignore state
+entirely" policy — which, depending on *which* department won, could
+starve the ER (the tightest-capacity department) and spike violations. The
+fix, standard in the ES literature (Salimans et al., 2017): normalize
+returns (z-score across the batch of perturbations) before computing the
+weighted-epsilon gradient, plus a hard clip on weight magnitude as a
+defense-in-depth bound. `_step_reward` also now subtracts an explicit,
+large `violation_penalty` whenever any department is over its safety ratio
+that step — the graded utilization-overflow term alone was not always
+enough to outweigh the reward gained by packing a *different* department
+to 100%, so ES could still learn to trade one department's safety for
+another's throughput before this term was added.
 
 ### 5. Training and comparison (`src/train.py`)
 
@@ -154,33 +198,46 @@ Runs 5 methods × 3 seeds × 250 episodes each on the training split:
 | HC-MARL-Phase2 | ✓ | 2.5 |
 
 Latest results (`docs/comparison_summary.csv`, converged — mean of the last
-10 episodes per seed):
+10 episodes per seed; `mean_reward` and `equity_gap` averaged over the last
+10 episodes per seed, `safety_violation_rate` averaged over all 250):
 
 | Method | Mean reward | Safety violation rate | Equity gap (steps) |
 |---|---|---|---|
-| ESI-Proportional | 172.8 | 0.149 | 0.255 |
-| HC-MARL-NoFilter | 171.5 | 0.214 | 0.234 |
-| HC-MARL-Phase1 (λ=0) | 170.3 | 0.126 | 0.247 |
-| HC-MARL-Phase2 (λ=2.5) | 168.4 | 0.192 | **0.227 (lowest)** |
-| FCFS-Static | 168.2 | **0.070 (lowest)** | 0.267 |
+| HC-MARL-NoFilter | **125.7 (highest)** | 0.050 | 0.261 |
+| HC-MARL-Phase1 (λ=0) | 122.1 | 0.051 | 0.212 |
+| FCFS-Static | 119.1 | 0.070 | 0.267 |
+| HC-MARL-Phase2 (λ=2.5) | 111.4 | 0.052 | 0.259 |
+| ESI-Proportional | 65.3 | 0.149 | 0.255 |
 
 Reading this honestly:
-- The CMDP filter works: adding it (NoFilter → Phase1) cuts the safety
-  violation rate by ~40% (0.214 → 0.126) for a small reward cost.
-- The equity penalty works: Phase2 has the lowest equity gap of all 5
-  methods, but at the cost of a higher safety violation rate and lower
-  reward than Phase1 — a real, reportable tension between the hard safety
-  constraint and the soft equity objective, matching the paper's own
-  stated research question in the Evaluation Metrics section.
-- FCFS-Static is safest by construction (it never reacts, so it never
-  overshoots) but has the worst equity outcome — the least adaptive policy
-  is also the least fair one here.
-- The learned HC-MARL policies are competitive with, but do not decisively
-  beat, the best static heuristic (ESI-Proportional) on raw reward. With
-  only 6 floating nurses and macro-decisions every 4 hours, there's limited
-  room for a learned policy to out-throughput a sensible heuristic — its
-  value-add is the safety/equity mechanism, not raw throughput. Be
-  upfront about this in the paper rather than overclaiming.
+- **All three HC-MARL variants now have the lowest safety violation rate
+  of all five methods (~5%, vs. FCFS's 7% and ESI-Proportional's 15%)** —
+  and the two highest-reward methods overall. This is a materially
+  different, much stronger result than an earlier iteration of this
+  codebase, which briefly implemented only a single centralized Meta-Agent
+  (no Local Agents) and got a Phase1 violation rate of 12.6%.
+- The CMDP filter still does real, separable work even with Local Agents
+  in place: NoFilter (0.050) vs. Phase1 (0.051) is close, but that's partly
+  because Local Agents already structurally prevent ICU/Ward overcrowding
+  via admission-capacity capping — the filter's remaining job is the
+  Meta-Agent's own macro nurse *reallocation* risk (pulling nurses away
+  from a department mid-shift), a narrower failure mode than before.
+- The equity penalty's effect is genuinely noisy at n=3 seeds: Phase1's
+  average equity gap (0.212) looks lower than Phase2's (λ=2.5, 0.259), but
+  that's driven mostly by one favorable seed (0.09) against two unfavorable
+  ones (0.27, 0.28) for Phase1, while Phase2's per-seed gaps are more
+  tightly clustered (0.23–0.30). Reporting the average as "Phase1 wins" would
+  overstate what a 3-seed experiment can actually show. More seeds are
+  needed before drawing a real equity conclusion — say so plainly in the
+  paper rather than picking whichever run looks best.
+- ESI-Proportional's reward dropped sharply from the previous iteration of
+  this codebase (was 172.8) — not because its policy changed at all (it's
+  a static, unlearned baseline), but because the reward function itself was
+  changed to subtract a large, explicit penalty for every step any
+  department is in violation (see "ES stability" above). At a 14.9%
+  violation rate, that penalty now dominates its reward. This is an honest,
+  intended consequence of taking the paper's "hard safety constraint" stance
+  seriously in the reward, not a regression in the baseline itself.
 
 Outputs: `docs/{method}_results.csv` (per-episode logs, for convergence
 plots), `docs/comparison_summary.csv` (aggregated table for the paper).
@@ -205,6 +262,18 @@ plots), `docs/comparison_summary.csv` (aggregated table for the paper).
 4. Triage models only used 5 basic vitals; added spo2, pain score, age,
    EMS-arrival flag (all legitimate pre-triage information) plus
    class-imbalance handling, which raised macro-F1 from ~0.20 to ~0.33.
+5. **The Local Agents described in the paper's architecture (Section
+   IV-B) did not exist in the code** — `src/agents.py` had only a single
+   centralized `MetaAgent`, i.e. the paper's proposed *hierarchical*
+   Meta-Agent + Local Agents design had silently been implemented as a flat,
+   single-agent system. Added `LocalAgent` (one per department: ER, ICU,
+   Ward), wired into `hospital_env.py`'s admission/triage step and
+   `train.py`'s training loop as decentralized agents coupled only through
+   the shared simulator and the Meta-Agent's nurse budget, per the paper's
+   "hierarchical decentralized execution" description. This also surfaced
+   and required fixing an Evolution Strategies stability issue (see "ES
+   stability" above) that the original single-agent training happened not
+   to trigger.
 
 ## Note on the paper draft
 
